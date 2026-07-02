@@ -12,10 +12,42 @@ const getAlternateFlights = async (req, res) => {
       return res.status(404).json({ message: "No alternate flights found" });
     }
 
+    const booking = await Booking.findOne({ bookingId });
+    const originalFare = booking && booking.fare && booking.fare.totalPaid != null
+      ? booking.fare.totalPaid
+      : null;
+
+    const alternatives = record.options.map((opt) => {
+      const alternateFare = opt.fare && opt.fare.amount != null ? opt.fare.amount : null;
+
+      let fareDifference = null;
+      let fareAction = "UNKNOWN";
+
+      if (originalFare !== null && alternateFare !== null) {
+        fareDifference = alternateFare - originalFare;
+        if (fareDifference > 0) fareAction = "FARE_DIFFERENCE_REQUIRED";
+        else if (fareDifference === 0) fareAction = "NO_ADDITIONAL_FARE";
+        else fareAction = "LOWER_FARE_AVAILABLE";
+      }
+
+      return {
+        flightId: opt.flightId,
+        flightNumber: opt.flightNumber,
+        origin: opt.origin,
+        destination: opt.destination,
+        departureTime: opt.departureTime,
+        arrivalTime: opt.arrivalTime,
+        label: opt.label,
+        fare: opt.fare,
+        fareDifference,
+        fareAction
+      };
+    });
+
     res.status(200).json({
       success: true,
       bookingId,
-      alternatives: record.options
+      alternatives
     });
   } catch (error) {
     res.status(500).json({ message: "Server error" });
@@ -51,25 +83,81 @@ const rebookFlight = async (req, res) => {
       return res.status(404).json({ message: "Selected alternate flight not found" });
     }
 
-    await RecoveryRequest.create({
-      requestId: `RR${Date.now()}`,
-      bookingId,
-      type: "REBOOK",
-      status: "CONFIRMED",
-      details: { selectedFlight }
-    });
+    const originalFare = booking.fare && booking.fare.totalPaid != null ? booking.fare.totalPaid : null;
+    const alternateFare = selectedFlight.fare && selectedFlight.fare.amount != null ? selectedFlight.fare.amount : null;
+    const fareDifference = originalFare !== null && alternateFare !== null ? alternateFare - originalFare : null;
 
-    booking.recoveryStatus = "REBOOKED";
+    // Reset OTP state regardless of fare path
     booking.verification.otpVerified = false;
     booking.verification.otpCode = null;
     booking.verification.otpGeneratedAt = null;
+
+    // Case 1 — no extra fare or lower fare: direct rebook
+    if (fareDifference === null || alternateFare <= originalFare) {
+      const requestId = `RBK-${Date.now()}-${bookingId}`;
+      const generatedAt = new Date().toISOString();
+
+      await RecoveryRequest.create({
+        requestId,
+        bookingId,
+        type: "REBOOK",
+        status: "CONFIRMED",
+        details: { selectedFlight }
+      });
+
+      booking.recoveryStatus = "REBOOKED";
+      booking.fareAdjustmentRequest = null;
+      await booking.save();
+
+      const slip = {
+        requestId,
+        bookingId,
+        type: "REBOOK",
+        status: "CONFIRMED",
+        generatedAt,
+        selectedFlight,
+        instruction: "Your flight has been rebooked successfully. Please keep this reference for your records."
+      };
+
+      return res.status(200).json({
+        success: true,
+        message: "Flight rebooked successfully",
+        recoveryStatus: "REBOOKED",
+        selectedFlight,
+        slip
+      });
+    }
+
+    // Case 2 — alternate fare is higher: fare adjustment required
+    const requestId = `RBK-${Date.now()}-${bookingId}`;
+    const generatedAt = new Date().toISOString();
+
+    booking.recoveryStatus = "PENDING_FARE_ADJUSTMENT";
+    booking.fareAdjustmentRequest = {
+      requestId,
+      selectedFlightId,
+      originalFare,
+      newFare: alternateFare,
+      fareDifference,
+      status: "PENDING_FARE_ADJUSTMENT",
+      generatedAt
+    };
     await booking.save();
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      message: "Flight rebooked successfully",
-      recoveryStatus: "REBOOKED",
-      selectedFlight
+      message: "Rebooking request created. Additional fare adjustment is required at the airport support desk.",
+      recoveryStatus: "PENDING_FARE_ADJUSTMENT",
+      requestType: "REBOOK_WITH_FARE_DIFFERENCE",
+      fareDifference,
+      originalFare,
+      newFare: alternateFare,
+      selectedFlight,
+      slip: {
+        requestId,
+        generatedAt,
+        instruction: "Please present this rebooking fare adjustment slip at the airport support desk for fare collection and final ticket reissue."
+      }
     });
   } catch (error) {
     res.status(500).json({ message: "Server error" });
@@ -97,12 +185,15 @@ const requestRefund = async (req, res) => {
       return res.status(400).json({ message: "Refund is not available for this booking" });
     }
 
-    await RecoveryRequest.create({
-      requestId: `RR${Date.now()}`,
+    const requestId = `REF-${Date.now()}-${bookingId}`;
+    const generatedAt = new Date().toISOString();
+
+    const recoveryRequest = await RecoveryRequest.create({
+      requestId,
       bookingId,
       type: "REFUND",
       status: "REQUESTED",
-      details: {}
+      details: { generatedAt }
     });
 
     booking.recoveryStatus = "REFUND_REQUESTED";
@@ -115,7 +206,14 @@ const requestRefund = async (req, res) => {
       success: true,
       message: "Refund request submitted successfully",
       recoveryStatus: "REFUND_REQUESTED",
-      requestType: "REFUND"
+      requestType: "REFUND",
+      slip: {
+        requestId,
+        bookingId,
+        type: "REFUND",
+        generatedAt,
+        instruction: "Your refund request has been submitted successfully. Please keep this reference for further communication."
+      }
     });
   } catch (error) {
     res.status(500).json({ message: "Server error" });
@@ -175,11 +273,6 @@ const verifyOtp = async (req, res) => {
       return res.status(400).json({ message: "Verification data not found for this booking" });
     }
 
-    // If OTP already verified earlier
-    if (booking.verification.otpVerified === true) {
-      return res.status(400).json({ message: "OTP already verified for this booking" });
-    }
-
     // No OTP currently generated
     if (!booking.verification.otpCode) {
       return res.status(400).json({ message: "No OTP has been generated for this booking" });
@@ -225,12 +318,15 @@ const requestSupport = async (req, res) => {
       return res.status(400).json({ message: "Support request is not available for this booking" });
     }
 
+    const supportRequestId = `SUP-${Date.now()}-${bookingId}`;
+    const supportGeneratedAt = new Date().toISOString();
+
     await RecoveryRequest.create({
-      requestId: `RR${Date.now()}`,
+      requestId: supportRequestId,
       bookingId,
       type: "SUPPORT",
       status: "OPEN",
-      details: { reason: reason || "" }
+      details: { reason: reason || "", generatedAt: supportGeneratedAt }
     });
 
     booking.recoveryStatus = "SUPPORT_REQUESTED";
@@ -243,7 +339,14 @@ const requestSupport = async (req, res) => {
       success: true,
       message: "Support request created successfully",
       recoveryStatus: "SUPPORT_REQUESTED",
-      requestType: "SUPPORT"
+      requestType: "SUPPORT",
+      slip: {
+        requestId: supportRequestId,
+        bookingId,
+        type: "SUPPORT",
+        generatedAt: supportGeneratedAt,
+        instruction: "Your support request has been submitted. Our team will contact you shortly. Please keep this reference number handy."
+      }
     });
   } catch (error) {
     res.status(500).json({ message: "Server error" });

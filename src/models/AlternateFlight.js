@@ -12,7 +12,11 @@ const alternateFlightSchema = new mongoose.Schema(
         destination: { type: String, required: true },
         departureTime: { type: String, required: true },
         arrivalTime: { type: String, required: true },
-        label: { type: String, default: "" }
+        label: { type: String, default: "" },
+        fare: {
+          currency: { type: String, default: "INR" },
+          amount: { type: Number, default: 0 }
+        }
       }
     ]
   },

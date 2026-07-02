@@ -60,6 +60,21 @@ const bookingSchema = new mongoose.Schema(
       eligibilityNote: { type: String, default: "" }
     },
 
+    fare: {
+      currency: { type: String, default: "INR" },
+      totalPaid: { type: Number, default: 0 }
+    },
+
+    fareAdjustmentRequest: {
+      requestId: { type: String, default: null },
+      selectedFlightId: { type: String, default: null },
+      originalFare: { type: Number, default: null },
+      newFare: { type: Number, default: null },
+      fareDifference: { type: Number, default: null },
+      status: { type: String, default: null },
+      generatedAt: { type: String, default: null }
+    },
+
     verification: {
       otpCode: { type: String, default: null },
       otpVerified: { type: Boolean, default: false },
@@ -68,7 +83,7 @@ const bookingSchema = new mongoose.Schema(
 
     recoveryStatus: {
       type: String,
-      enum: ["PENDING", "REBOOKED", "REFUND_REQUESTED", "SUPPORT_REQUESTED"],
+      enum: ["PENDING", "REBOOKED", "REFUND_REQUESTED", "SUPPORT_REQUESTED", "PENDING_FARE_ADJUSTMENT"],
       default: "PENDING"
     }
   },
